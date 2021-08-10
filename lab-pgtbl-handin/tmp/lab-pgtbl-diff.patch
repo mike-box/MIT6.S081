@@ -1,0 +1,361 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a73b4f7..c824fe2 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -178,6 +178,17 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t);
++pagetable_t     prockvminit();
++void            prockvminithart(pagetable_t  pagetable);
++void            prockvmmap(pagetable_t pagetable,uint64 va, uint64 pa, uint64 sz, int perm);
++void            procfreekpt(pagetable_t pagetable);
++int             procuvmcopy(pagetable_t uvm,pagetable_t kvm,uint64 old_sz, uint64 new_sz);
++
++// vmcopy.c
++int copyin_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len);
++int copyinstr_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max);
++
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 0e8762f..b9baab2 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -112,10 +112,17 @@ exec(char *path, char **argv)
+   oldpagetable = p->pagetable;
+   p->pagetable = pagetable;
+   p->sz = sz;
++
++  uvmunmap(p->kpagetable, 0, PGROUNDUP(oldsz)/PGSIZE, 0);
++  if(procuvmcopy(p->pagetable,p->kpagetable,0,p->sz) < 0)
++  	goto bad;
++  
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+-  proc_freepagetable(oldpagetable, oldsz);
+-
++  proc_freepagetable(oldpagetable, oldsz); 
++  if(p->pid==1) {
++  	vmprint(p->pagetable);
++  }
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..bac377b 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -107,6 +107,10 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+ 
++  // map kernel stack to the kernel page table
++  p->kpagetable = prockvminit();
++  prockvmmap(p->kpagetable,p->kstack,kvmpa(p->kstack),PGSIZE, PTE_R | PTE_W);
++  
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+     release(&p->lock);
+@@ -142,6 +146,11 @@ freeproc(struct proc *p)
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
++  //release kernel page table and kernel stack
++  if(p->kpagetable) { 
++  	procfreekpt(p->kpagetable);
++  }
++  p->kpagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+   p->parent = 0;
+@@ -221,6 +230,9 @@ userinit(void)
+   uvminit(p->pagetable, initcode, sizeof(initcode));
+   p->sz = PGSIZE;
+ 
++  // copy one page of the 
++  procuvmcopy(p->pagetable, p->kpagetable,0,PGSIZE) ;
++
+   // prepare for the very first "return" from kernel to user.
+   p->trapframe->epc = 0;      // user program counter
+   p->trapframe->sp = PGSIZE;  // user stack pointer
+@@ -238,19 +250,31 @@ userinit(void)
+ int
+ growproc(int n)
+ {
+-  uint sz;
+-  struct proc *p = myproc();
++	 uint sz;
++	 struct proc *p = myproc();
++
++	 sz = p->sz;
++	 if(n > 0){
++	   // check the virtual address is no more than 0x0c000000L
++	   if((sz + n) >= PLIC){
++		 return -1;
++	   }
++	   // malloc 
++	   if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
++		 return -1;
++	   }
++	   // mapper user page to kernel page table
++	   if((procuvmcopy(p->pagetable, p->kpagetable, p->sz, sz)) < 0){
++		  return -1;
++	   }
++	 } else if(n < 0){
++	   sz = uvmdealloc(p->pagetable, sz, sz + n);
++	   // remove all the pages from the kernel table
++	   uvmunmap(p->kpagetable,PGROUNDUP(sz),(PGROUNDUP(p->sz)-PGROUNDUP(sz))/PGSIZE,0);
++	 }
++	 p->sz = sz;
++	 return 0;
+ 
+-  sz = p->sz;
+-  if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+-      return -1;
+-    }
+-  } else if(n < 0){
+-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+-  }
+-  p->sz = sz;
+-  return 0;
+ }
+ 
+ // Create a new process, copying the parent.
+@@ -277,6 +301,13 @@ fork(void)
+ 
+   np->parent = p;
+ 
++  // Copy user memory mapper the kernel page table to child
++  if(procuvmcopy(np->pagetable, np->kpagetable,0,np->sz) < 0){
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
+@@ -473,6 +504,8 @@ scheduler(void)
+         // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
++	    // load kernel pagetable address into page table
++	    prockvminithart(p->kpagetable);
+         swtch(&c->context, &p->context);
+ 
+         // Process is done running for now.
+@@ -485,6 +518,8 @@ scheduler(void)
+     }
+ #if !defined (LAB_FS)
+     if(found == 0) {
++	  // use kernel pagetable when no process runing
++	  kvminithart();
+       intr_on();
+       asm volatile("wfi");
+     }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..7858834 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -98,6 +98,7 @@ struct proc {
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
++  pagetable_t kpagetable;      // Kernel page table
+   struct trapframe *trapframe; // data page for trampoline.S
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..b7cc931 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -379,23 +379,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ int
+ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ {
+-  uint64 n, va0, pa0;
+-
+-  while(len > 0){
+-    va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
+-      return -1;
+-    n = PGSIZE - (srcva - va0);
+-    if(n > len)
+-      n = len;
+-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+-
+-    len -= n;
+-    dst += n;
+-    srcva = va0 + PGSIZE;
+-  }
+-  return 0;
++   return copyin_new(pagetable,dst,srcva,len);
+ }
+ 
+ // Copy a null-terminated string from user to kernel.
+@@ -405,38 +389,130 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ int
+ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ {
+-  uint64 n, va0, pa0;
+-  int got_null = 0;
++  return copyinstr_new(pagetable,dst,srcva,max);   
++}
+ 
+-  while(got_null == 0 && max > 0){
+-    va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
+-      return -1;
+-    n = PGSIZE - (srcva - va0);
+-    if(n > max)
+-      n = max;
+-
+-    char *p = (char *) (pa0 + (srcva - va0));
+-    while(n > 0){
+-      if(*p == '\0'){
+-        *dst = '\0';
+-        got_null = 1;
+-        break;
+-      } else {
+-        *dst = *p;
++int pteprint(pagetable_t pagetable,int level){  
++  for(int i = 0; i < 512; ++i){
++    pte_t *pte = &pagetable[i];
++    // level page table entry
++    if(*pte & PTE_V) {
++      // page table is valid
++      for(int j = 2; j > level; --j){
++         printf(".. ");
+       }
+-      --n;
+-      --max;
+-      p++;
+-      dst++;
+-    }
+-
+-    srcva = va0 + PGSIZE;
++      printf("..%d: pte %p pa %p\n\r",i,*pte,(pagetable_t)PTE2PA(*pte));
++      if(level >= 1){
++         pteprint((pagetable_t)PTE2PA(*pte),level-1);
++      }
++    } 
+   }
+-  if(got_null){
+-    return 0;
+-  } else {
+-    return -1;
++
++  return 0;
++}
++
++void vmprint(pagetable_t pagetable){
++  printf("page table %p\n",pagetable);
++  pteprint(pagetable,2);
++}
++
++pagetable_t
++prockvminit(){
++	pagetable_t pagetable = (pagetable_t) kalloc();
++	if(pagetable == 0)
++		panic("kalloc");
++	
++	// each page size is 4096 byte = 4KB
++	// kernel page table
++	memset(pagetable, 0, PGSIZE);
++
++	// uart registers
++	// uart mmmap
++	prockvmmap(pagetable,UART0, UART0, PGSIZE, PTE_R | PTE_W);
++
++	// virtio mmio disk interface
++	prockvmmap(pagetable,VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
++
++	// CLINT
++	//prockvmmap(pagetable,CLINT, CLINT, 0x10000, PTE_R | PTE_W);
++
++	// PLIC
++	prockvmmap(pagetable,PLIC, PLIC, 0x400000, PTE_R | PTE_W);
++
++	// map kernel text executable and read-only.
++	prockvmmap(pagetable,KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
++
++	// map kernel data and the physical RAM we'll make use of.
++	prockvmmap(pagetable,(uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
++
++	// map the trampoline for trap entry/exit to
++	// the highest virtual address in the kernel.
++	prockvmmap(pagetable,TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
++
++	return pagetable;
++}
++
++void
++prockvminithart(pagetable_t  pagetable)
++{
++  w_satp(MAKE_SATP(pagetable));
++  sfence_vma();
++}
++
++
++void
++prockvmmap(pagetable_t pagetable,uint64 va, uint64 pa, uint64 sz, int perm)
++{
++  if(mappages(pagetable, va, sz, pa, perm) != 0){
++  	printf("va = %p sz = %p \n\r",va,sz);
++    panic("prockvmmap");
+   }
+ }
++
++void freepte(pagetable_t pagetable,int level){
++   for(int i = 0; i < 512; ++i){
++		pte_t *pte = &pagetable[i];
++		// level page table entry
++		if(*pte & PTE_V) {
++		  if(level == 2){
++		     freepte((pagetable_t)PTE2PA(*pte),level-1);
++		  }else{
++		     kfree((pagetable_t)PTE2PA(*pte));
++		  }
++		} 
++	}
++    kfree(pagetable);
++}
++void procfreekpt(pagetable_t pagetable){
++  freepte(pagetable,2);
++}
++
++int procuvmcopy(pagetable_t uvm,pagetable_t kvm,uint64 old_sz, uint64 new_sz){
++	pte_t *pte;
++	uint64 pa, i;
++	uint flags;
++	
++	old_sz = PGROUNDUP(old_sz);
++	if (new_sz <= old_sz) return 0;
++
++	for(i = old_sz; i < new_sz; i += PGSIZE){
++		if((pte = walk(uvm, i, 0)) == 0)
++			panic("procuvmcopy: pte should exist");
++		if((*pte & PTE_V) == 0)
++			panic("procuvmcopy: page not present");
++		pa = PTE2PA(*pte);
++		flags = PTE_FLAGS(*pte);
++		if(mappages(kvm, i, PGSIZE, pa, flags&(~PTE_U)) != 0){
++			panic("procuvmcopy: remap");
++			goto err;
++		}
++	}
++	return 0;
++
++err:
++	uvmunmap(kvm, 0, i / PGSIZE, 1);
++	return -1; 
++}
++
++
++
