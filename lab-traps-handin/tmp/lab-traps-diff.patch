@@ -1,0 +1,1188 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..704c832 100644
+--- a/Makefile
++++ b/Makefile
+@@ -42,6 +42,11 @@ OBJS += \
+ 	$K/vmcopyin.o
+ endif
+ 
++ifeq ($(LAB),traps)
++OBJS += \
++	$K/linetable.o
++endif
++
+ ifeq ($(LAB),$(filter $(LAB), pgtbl lock))
+ OBJS += \
+ 	$K/stats.o\
+@@ -116,7 +121,6 @@ $K/kernel: $(OBJS) $K/kernel.ld $U/initcode
+ 	$(LD) $(LDFLAGS) -T $K/kernel.ld -o $K/kernel $(OBJS) 
+ 	$(OBJDUMP) -S $K/kernel > $K/kernel.asm
+ 	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
+-
+ $U/initcode: $U/initcode.S
+ 	$(CC) $(CFLAGS) -march=rv64g -nostdinc -I. -Ikernel -c $U/initcode.S -o $U/initcode.o
+ 	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o $U/initcode.out $U/initcode.o
+@@ -187,7 +191,8 @@ endif
+ ifeq ($(LAB),traps)
+ UPROGS += \
+ 	$U/_call\
+-	$U/_bttest
++	$U/_bttest\
++	$U/_alarmtest
+ endif
+ 
+ ifeq ($(LAB),lazy)
+@@ -240,9 +245,13 @@ ifeq ($(LAB),util)
+ 	UEXTRA += user/xargstest.sh
+ endif
+ 
++KEXTRA = kernel.elf
+ 
+ fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
+-	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS)
++ifeq ($(LAB),traps)
++	cp kernel/kernel kernel.elf
++endif
++	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS) $(KEXTRA)
+ 
+ -include kernel/*.d user/*.d
+ 
+@@ -320,6 +329,8 @@ grade:
+ ## FOR web handin
+ ##
+ 
++gdb:
++	riscv64-unknown-elf-gdb kernel/kernel
+ 
+ WEBSUB := https://6828.scripts.mit.edu/2020/handin.py
+ 
+diff --git a/answers-traps.txt b/answers-traps.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/arrtoline b/arrtoline
+new file mode 100644
+index 0000000..1e67a93
+Binary files /dev/null and b/arrtoline differ
+diff --git a/gradelib.pyc b/gradelib.pyc
+new file mode 100644
+index 0000000..c138f9f
+Binary files /dev/null and b/gradelib.pyc differ
+diff --git a/kernel.elf b/kernel.elf
+new file mode 100644
+index 0000000..db0cdcb
+Binary files /dev/null and b/kernel.elf differ
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..4fc63a9 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace();
+ 
+ // proc.c
+ int             cpuid(void);
+@@ -183,5 +184,12 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++//linetable.c
++uint32          ltinit();
++int             ltloadelf(char * file);
++int             ltaddr2line(uint64 address, char * file, int* line);
++void            ltdump();
++
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/elf.h b/kernel/elf.h
+index 84555fa..609527a 100644
+--- a/kernel/elf.h
++++ b/kernel/elf.h
+@@ -3,7 +3,7 @@
+ #define ELF_MAGIC 0x464C457FU  // "\x7FELF" in little endian
+ 
+ // File header
+-struct elfhdr {
++typedef struct elfhdr {
+   uint magic;  // must equal ELF_MAGIC
+   uchar elf[12];
+   ushort type;
+@@ -19,10 +19,10 @@ struct elfhdr {
+   ushort shentsize;
+   ushort shnum;
+   ushort shstrndx;
+-};
++}elfhdr;
+ 
+ // Program section header
+-struct proghdr {
++typedef struct proghdr {
+   uint32 type;
+   uint32 flags;
+   uint64 off;
+@@ -31,7 +31,65 @@ struct proghdr {
+   uint64 filesz;
+   uint64 memsz;
+   uint64 align;
+-};
++}proghdr;
++
++//section header
++typedef struct secthdr{
++    uint32   sh_name;  // 节区名称相对于字符串表的位置偏移
++    uint32   sh_type;  // 节区类型
++    uint64   sh_flags;  // 节区标志位集合
++    uint64   sh_addr;  // 节区装入内存的地址
++    uint64   sh_offset;  // 节区相对于文件的位置偏移
++    uint64   sh_size;  // 节区内容大小
++    uint32   sh_link;  // 指定链接的节索引，与具体的节有关
++    uint32   sh_info;  // 指定附加信息
++    uint64   sh_addralign;  // 节装入内存的地址对齐要求
++    uint64   sh_entsize;  // 指定某些节的固定表大小，与具体的节有关
++}secthdr ;
++
++//debug line information
++typedef struct dlhdr{
++	uint32  dl_length;
++	uint16  dl_dfversion;
++	uint32  dl_prolength;
++	uint8   dl_milength;
++	uint8   dl_isstmt;
++ 	int     dl_linebase; //modfiy with signed interger
++ 	uint8   dl_linerange;
++	uint8   dl_opcodebase;
++}dlhdr;
++
++
++//ELF file section header type
++#define SHT_NULL      0 //无对应节区，该节其他字段取值无意义
++#define SHT_PROGBITS  1 //程序数据
++#define SHT_SYMTAB    2 // 符号表
++#define SHT_STRTAB   3 //字符串表
++#define SHT_RELA    4 //带附加的重定位项
++#define SHT_HASH    5 //符号哈希表
++#define SHT_DYNAMIC   6 //动态链接信息
++#define SHT_NOTE    7 //提示性信息
++#define SHT_NOBITS    8//无数据程序空间（bss）
++#define SHT_REL       9 //无附加的重定位项
++#define SHT_SHLIB    10 //保留
++#define SHT_DYNSYM     11//动态链接符号表
++#define SHT_INIT_ARRAY    14 //构造函数数组
++#define SHT_FINI_ARRAY    15 //析构函数数组
++#define SHT_PREINIT_ARRAY   16 //
++#define SHT_GROUP            17//
++#define SHT_SYMTAB_SHNDX    18 //
++#define SHT_NUM            19//
++#define SHT_LOPROC    0x70000000
++#define SHT_HIPROC     0x7fffffff
++#define SHT_LOUSER  0x80000000
++#define SHT_HIUSER  0x8fffffff
++
++//section header flag
++#define SHF_WRITE  1
++#define SHF_ALLOC  2
++#define SHF_EXECINSTR 4
++#define SHF_MASKPROC 8
++
+ 
+ // Values for Proghdr type
+ #define ELF_PROG_LOAD           1
+diff --git a/kernel/linetable.c b/kernel/linetable.c
+new file mode 100644
+index 0000000..a5cb48c
+--- /dev/null
++++ b/kernel/linetable.c
+@@ -0,0 +1,562 @@
++#include <stdarg.h>
++#include "types.h"
++#include "riscv.h"
++#include "defs.h"
++#include "elf.h"
++#include "linetable.h"
++
++#define ALIGN_PTR(cptr,sptr,b) ((cptr) + ((b) -((cptr)-(sptr))%(b)))
++#define MAX_TABLE_ROW_LEN   10000
++#define MAX_FILE_ROW_LEN    200
++#define MAX_DIR_ROW_LEN     100
++#define MAX_FILE_NAME_LEN   64
++#define MAX_DIR_NAME_LEN    64
++#define ELF_FILE_NAME              "kernel.elf"
++#define ELF_DATA_LEN        524288
++
++// line table
++struct linetablerow g_linetable[MAX_TABLE_ROW_LEN];
++// dir table
++struct dirdesc g_dirtable[MAX_DIR_ROW_LEN];
++// file table
++struct filedesc g_filetable[MAX_FILE_ROW_LEN];
++
++//elf table
++uint8 g_elfdata[ELF_DATA_LEN];
++uint32 g_elffile_sz;
++uint32 g_linetable_sz;
++uint32 g_filetable_sz;
++uint32 g_dirtable_sz;
++
++void fatal_impl(const char* file, int line, const char* fmt, ...) {
++  va_list ap;
++  va_start(ap, fmt);
++  printf("%s:%d: ", file, line);
++  //vprintf(fmt, ap);
++  printf("\n");
++  exit(1);
++}
++
++#define fatal(fmt, args...) fatal_impl(__FILE__, __LINE__, fmt, ##args)
++#define check(x) if (!(x)) { fatal("check %s failed", #x); }
++
++//#define trace_on
++#ifdef trace_on
++#define trace printf
++#else
++#define trace if (0) printf
++#endif
++
++extern int ltloadelf(char * file);
++extern secthdr * ltlookupsection(const char * target);
++extern void ltparseline();
++extern int ltaddr2line(uint64 address, char * file, int* line);
++extern void ltdump();
++
++uint32 ltinit(){
++	g_linetable_sz = 0;
++	g_filetable_sz = 0;
++	g_dirtable_sz = 0;
++	trace("init lttable!\n\r");
++	ltloadelf(ELF_FILE_NAME);
++	ltparseline();
++	//ltdump();
++	return 0;
++}
++
++static int strcmp(const char *p, const char *q)
++{
++  while(*p && *p == *q)
++    p++, q++;
++  return (uchar)*p - (uchar)*q;
++}
++
++
++static int ltchar2int(int8 x){
++	if(x&(1<<7)){
++	   return x-256;
++	}else{
++	   return x;
++	}
++}
++
++
++static uint8 * ltread(uint8  * src,uint8* dst, int n) {
++	memmove(dst, src, n);
++	return src + n;
++}
++
++static uint8 * ltreaduint8(uint8  * src,uint8* out) { 
++	return ltread(src,out, 1);
++}
++
++
++static uint8 *ltreadint8(int8  * src,int8 * out) {
++	memmove(out, src, 1);
++	return (uint8 *)src + 1;
++}
++
++static uint8 * ltreaduint16(uint8  * src,uint16 * out) { 
++	return ltread(src,(uint8 *)out, 2); 
++}
++
++static uint8 * ltreaduint32(uint8  * src,uint32 * out) { 
++	return ltread(src,(uint8 *)out, 4);
++}
++
++
++static uint8 * ltreaduint64(uint8  * src,uint64 * out) { 
++	return ltread(src,(uint8 *)out, 8);
++}
++
++static uint8 * ltreadstr(uint8  * src,char * dst) {
++	uint8 c;
++	int len = 0;
++	
++	for (;;) {
++	  src = ltreaduint8(src,&c);
++	  dst[len] = c;
++	  len++;
++	  if (c == 0)
++		break;
++	}
++	
++	return src;
++}
++
++static uint8 * ltreaduleb128(uint8  * src,uint64 * out) {
++	uint64 value = 0;
++	int shift = 0;
++	uint8 b;
++	
++	for (;;) {
++	  src = ltreaduint8(src,&b);
++	  value |= ((uint64)b & 0x7F) << shift;
++	  if ((b & 0x80) == 0)
++	    break;
++	  shift += 7;
++	}
++	
++	if (out)
++	  *out = value;
++	return src;
++}
++
++static uint8 * ltreadsleb128(uint8 * src,uint64 * out) {
++    uint64 value = 0;
++    int shift = 0;
++    uint8 b;
++	
++    for (;;) {
++	  src = ltreaduint8(src,&b);
++      value |= ((uint64)b & 0x7F) << shift;
++      shift += 7;
++      if ((b & 0x80) == 0)
++        break;
++    }
++    if (shift < 64 && (b & 0x40))
++      value |= -(1 << shift);
++    if (out)
++      *out = value;
++	
++    return src;
++}
++
++
++
++/*
++static uint8 * ltreadinitiallength(uint8 * src,uint32 *out) {
++	src = ltreaduint32(src,out);
++	if ((*out & 0xFFFFFFF0) == 0xFFFFFFF0)
++	  fatal("initial length extension (dwarf64?) unimplemented");
++	return src;
++}
++
++
++static uint8 * ltalign(uint8 * curr,uint8 * start,int boundary) {
++	return ALIGN_PTR(curr,start,boundary);
++}
++*/
++
++static int ltinitregister(struct lineregister *reg,uint32 offset){
++	reg->address = 0;
++	reg->file = offset;
++	reg->line = 1;
++	reg->column = 0;
++	reg->basic_block = 0;
++	reg->end_sequence = 0;
++	reg->prologue_end = 0;
++	reg->epilogue_begin = 0;
++	reg->isa = 0;
++	reg->discriminator = 0;
++	
++	return 0;
++}
++
++static int ltemit(const struct lineregister *reg){
++    if (reg->address != 0) {
++	  //int file = reg.file;
++	  trace("emit %p %d %d\n",reg->address,reg->file,reg->line);
++	  g_linetable[g_linetable_sz].addr = reg->address;
++	  g_linetable[g_linetable_sz].file = reg->file;
++	  g_linetable[g_linetable_sz].line = reg->line;
++	  g_linetable_sz++;
++	}
++
++	return 0;
++}
++
++int ltloadelf(char * file){
++	struct elfhdr *elf;
++	struct inode *ip;
++
++	// open elf file
++	begin_op();
++	if((ip = namei(file)) == 0){
++		end_op();
++		return -1;
++	}
++	ilock(ip);
++
++	//read elf 
++	g_elffile_sz = readi(ip, 0, (uint64)g_elfdata, 0, sizeof(g_elfdata));
++	if(g_elffile_sz < sizeof(struct elfhdr))
++		goto bad;
++	trace("read elf file,size = %d\n\r",g_elffile_sz);
++
++	// Check ELF header
++	elf = (struct elfhdr *)g_elfdata;
++	if(elf->magic != ELF_MAGIC)
++	   goto bad;
++	iunlockput(ip);
++    end_op();
++    ip = 0;	
++	
++	trace("read elf file success!\n");
++bad:
++   if(ip){
++	 iunlockput(ip);
++	 end_op();
++   }
++   
++   return -1;
++}
++
++secthdr * ltlookupsection(const char * target) {
++  struct elfhdr * header = (elfhdr *)g_elfdata;
++  struct secthdr * sheaders = (struct secthdr*)(g_elfdata + header->shoff);
++  int sheader_count = header->shnum;
++
++  struct secthdr * sheader_names = &sheaders[header->shstrndx];
++  char* names = (char*)&g_elfdata[sheader_names->sh_offset];
++
++  //get the target section
++  for (int i = 0; i < sheader_count; i++) {
++    struct secthdr* shdr = &sheaders[i];
++    char* name = names + shdr->sh_name;
++    if (strcmp(name, target) == 0){
++	  trace("lookup section success!\n");
++      return shdr;
++    }
++  }
++  
++  return NULL;
++}
++
++static int ltparseone(uint8 * data, int len)
++{	
++  uint8 * p = data;
++  uint8 * end = NULL;
++  dlhdr header;  
++  char  c = 0;
++  uint32 fileoffset = g_filetable_sz;
++  uint32 diroffset = g_dirtable_sz;
++  struct lineregister regs;
++  
++  //read header Length
++  p = ltreaduint32(p, &header.dl_length);
++  p = ltreaduint16(p, &header.dl_dfversion);
++  p = ltreaduint32(p, &header.dl_prolength);
++  p = ltreaduint8(p, &header.dl_milength);
++  p = ltreaduint8(p, &header.dl_isstmt);
++  p = ltreadint8((int8 *)p,(int8 *)&c);
++  header.dl_linebase = ltchar2int(c);
++  p = ltreaduint8(p, &header.dl_linerange);
++  p = ltreaduint8(p, &header.dl_opcodebase);
++  end = data + header.dl_length + 4;
++  
++  trace("Offset:%d\n",header.dl_length);  
++  trace("DWARF Version:%d\n",header.dl_dfversion);
++  trace("Prologue Length:%d\n",header.dl_prolength);
++  trace("Minimum Instruction Length:%d\n",header.dl_milength);
++  trace("Initial value of 'is_stmt':%d\n",header.dl_isstmt);
++  trace("Line Base:%d\n",header.dl_linebase);
++  trace("Line Range:%d\n",header.dl_linerange);
++  trace("Opcode Base:%d\n",header.dl_opcodebase);
++
++  //Opcodes
++  for (int i = 1; i < header.dl_opcodebase; i++) {
++	// In theory, we could record the opcode lengths here.
++	// But we don't need them.
++	uint8 c;
++	p = ltreaduint8(p,&c);
++    trace("%d op = %d\n",i,c); 
++  }
++
++  //Directory table
++  for (;;) {
++	char dir[MAX_FILE_NAME_LEN];
++	p = ltreadstr(p, dir);
++  	if(strlen(dir) == 0)
++		break;	
++	//record path.
++	memset(g_dirtable[g_dirtable_sz].name,0,MAX_FILE_NAME_LEN);
++	memmove((void *)g_dirtable[g_dirtable_sz].name,(void *)dir,strlen(dir));
++	trace("read dirname  = %s,index = %d\n",g_dirtable[g_dirtable_sz].name,g_dirtable_sz);
++	g_dirtable_sz++;
++  }
++
++  //File Name Table
++  for (;;) {
++	char file[MAX_FILE_NAME_LEN];
++	p = ltreadstr(p, file);
++	if(strlen(file) == 0)
++		break;
++	uint64 dir_index = 0, mtime = 0, file_length = 0;
++	p = ltreaduleb128(p,&dir_index);
++	p = ltreaduleb128(p,&mtime);
++	p = ltreaduleb128(p,&file_length);
++	memmove(g_filetable[g_filetable_sz].name,file,strlen(file));
++	g_filetable[g_filetable_sz].dir = dir_index + diroffset - 1;
++	g_filetable[g_filetable_sz].idx = g_filetable_sz;
++	trace("read filename  = %s,dir = %d ,index = %d\n",file,dir_index,g_filetable_sz);
++	g_filetable_sz++;
++	trace("%s %d %d %d\n", file, (int)dir_index, (int)mtime, (int)file_length);
++  }
++
++  //Registers regs(default_is_stmt);
++  regs.is_stmt = header.dl_isstmt;
++  ltinitregister(&regs,fileoffset);
++  
++  while (p < end) {
++	uint8 op;
++	uint16 pc;
++	uint64 tmp;
++	uint64 len;
++    uint64 addr;
++	uint64 delta;
++	uint64 file;
++	int adjusted_opcode;
++	int address_increment;
++	char str[MAX_FILE_NAME_LEN];
++	//int line_increment;
++	
++	// read op 
++	p = ltreaduint8(p,&op);
++	trace("op = %x \n", op);
++	switch (op) {
++		case 0x0: { // extended
++		  p = ltreaduleb128(p,&len);  // length
++		  p = ltreaduint8(p,&op);
++		  trace("exten op code = %d\n",op);
++		  switch (op) {
++			  case 0x01:  // DW_LNE_end_sequence
++				trace("end sequence\n");
++				regs.end_sequence = 1;
++				ltemit(&regs);
++				ltinitregister(&regs,fileoffset);
++				//regs = Registers(default_is_stmt);
++				break;
++			  case 0x02:  // DW_LNE_set_address
++				p = ltreaduint64(p,&addr);
++				trace("set addr %p\n", addr);
++				regs.address = addr;
++				break;
++			  case 0x04:  // DW_LNE_set_discriminator
++				ltreaduleb128(p,&addr);
++				trace("set discriminator %d\n", (int)addr);
++				regs.discriminator = (int)addr;
++				break;
++			  case 0x03:  // DW_LNE_define_file
++				p = ltreadstr(p, str);
++			    p = ltreaduleb128(p,&tmp);
++				p = ltreaduleb128(p,&tmp);
++				p = ltreaduleb128(p,&tmp);
++			  case 0x80:  // DW_LNE_lo_user
++			  case 0xff:  // DW_LNE_hi_user
++			  default:
++				trace("unhandled extended op 0x%x\n", op);
++		  }
++		  break;
++		}
++
++		case 0x1:  // DW_LNS_copy
++		  trace("copy\n");
++		  ltemit(&regs);
++		  regs.basic_block = 0;
++		  regs.prologue_end = 0;
++		  regs.epilogue_begin = 0;
++		  //regs.discriminator = 0;
++		  break;
++
++		case 0x2: {  // DW_LNS_advance_pc
++		  p = ltreaduleb128(p,&delta);
++		  delta *= header.dl_milength;
++		  regs.address += delta;
++		  trace("advance pc %d => %p\n", (int)delta, (long long)regs.address);
++		  break;
++		}
++
++		case 0x3: {  // DW_LNS_advance_line
++		  p = ltreadsleb128(p,&delta);
++		  regs.line += delta;
++		  trace("advance line %d => %d\n", (int)delta, (int)regs.line);
++		  break;
++		}
++
++		case 0x4: { // DW_LNS_set_file
++		  p = ltreaduleb128(p,&file);
++		  regs.file = file + fileoffset - 1;
++		  trace("set file = %d\n",regs.file);
++		  break;
++		}
++
++		case 0x5: { // DW_LNS_set_column
++		  p = ltreaduleb128(p,&tmp);
++		  trace("unimpl DW_LNS_set_column\n");
++		  break;
++		}
++
++		case 0x6: { // DW_LNS_negate_stmt
++		  trace("negate stmt\n");
++		  regs.is_stmt = 1 - regs.is_stmt;
++		  break;
++		}
++
++		case 0x7: { // DW_LNS_set_basic_block
++		  regs.basic_block = 1;
++		  trace("unimpl\n");
++		  break;
++		}
++
++		case 0x8: { // DW_LNS_const_add_pc
++		  adjusted_opcode = 255 - header.dl_opcodebase;
++		  address_increment = (adjusted_opcode/header.dl_linerange) * header.dl_milength;
++		  regs.address += address_increment;
++		  trace("add pc %d => %p\n", address_increment, regs.address);
++		  break;
++		}
++
++		case 0x9: { // DW_LNS_fixed_advance_pc
++		  p = ltreaduint16(p,&pc);
++		  regs.address += pc;
++		  trace("DW_LNS_fixed_advance_pc address = %p\n",regs.address);
++		  break;
++		}
++
++		case 0xa: { // DW_LNS_set_prologue_end
++		  regs.prologue_end = 1;
++		  break;
++		}
++
++		case 0xb: { // DW_LNS_set_epilogue_begin
++		  regs.epilogue_begin = 1;
++		  break;
++		}
++
++		case 0xc: { // DW_LNS_set_isa
++		  regs.isa = 1;
++		  break;
++		}
++		
++		default: {
++		   break;
++		}
++	}
++  }
++  trace("detech len = %d\n",end - data);
++  
++  return end - data;
++}
++
++void ltparseline() {
++  uint8 * data = NULL;
++  int len = 0;  
++
++  //read elf debug_line section
++  struct secthdr * shdr_lines = ltlookupsection(".debug_line");
++  if (!shdr_lines)
++    fatal("couldn't find .debug_line\n");
++
++  //parse debug line section
++  data = g_elfdata + shdr_lines->sh_offset;
++  len = shdr_lines->sh_size;
++  trace("section len = %d\n",len);
++   
++  //parese one line
++  while (len > 0) {
++    uint32 one_len = ltparseone(data, len);	
++    data += one_len;
++    len -= one_len;
++	trace("parse len = %d\n",len);
++  }
++  //ltdump();
++  //sort line number
++}
++
++int ltaddr2line(uint64 address, char * file, int* line) {
++   int left = 0;
++   int right = g_linetable_sz - 1;
++   int target = -1;
++   char path[128];
++
++   //upper_bound 
++   while(left <= right){
++	   int mid = (left + right)>>1;
++	   if(address < g_linetable[mid].addr){
++		 right = mid - 1;
++	   }else{
++	     target = mid;
++		 left = mid + 1;
++	   }
++   }
++
++   if(target < 0) return -1;
++   int fid = g_linetable[target].file;
++   int did = g_filetable[fid].dir;
++   memset(path,0,sizeof(path));
++   memmove(file,g_dirtable[did].name,strlen(g_dirtable[did].name));
++   memmove(file + strlen(file),"/",1);
++   memmove(file + strlen(file),g_filetable[fid].name,strlen(g_filetable[fid].name));
++   *line = g_linetable[target].line;
++   
++   return 0;
++}
++
++void ltdump(){
++	//dump dir table
++	printf("dir table:\n");
++	printf("index    dirname\n");
++	printf("------------------------------------------------------\n");
++	for(int i = 0; i < g_dirtable_sz; ++i){
++		printf(" %d     %s\n",i,g_dirtable[i].name);
++	}
++	
++	//dump file table
++	printf("file table:\n");
++	printf("index    dindex     filename\n");
++	printf("------------------------------------------------------\n");
++	for(int i = 0; i < g_filetable_sz; ++i){
++		printf(" %d       %s/%s\n",i,g_dirtable[g_filetable[i].dir].name,g_filetable[i].name);
++	}
++	
++	//dump line table
++	printf("address table:\n");
++	printf("index    address      filename         line\n");
++	printf("------------------------------------------------------\n");
++	for(int i = 0; i < g_linetable_sz; ++i){
++		printf(" %d       %s     %d      %p\n",i,g_filetable[g_linetable[i].file].name,g_linetable[i].line,g_linetable[i].addr);
++	}
++}
++
++
+diff --git a/kernel/main.c b/kernel/main.c
+index 5d7ad49..7165a73 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -27,7 +27,7 @@ main()
+     binit();         // buffer cache
+     iinit();         // inode cache
+     fileinit();      // file table
+-    virtio_disk_init(); // emulated hard disk
++    virtio_disk_init();  // emulated hard disk
+     userinit();      // first user process
+     __sync_synchronize();
+     started = 1;
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..f213376 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -15,6 +15,7 @@
+ #include "defs.h"
+ #include "proc.h"
+ 
++#define KERNEL_FILE "kernel.elf"
+ volatile int panicked = 0;
+ 
+ // lock to avoid interleaving concurrent printf's.
+@@ -120,6 +121,7 @@ panic(char *s)
+   pr.locking = 0;
+   printf("panic: ");
+   printf(s);
++  backtrace();
+   printf("\n");
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+@@ -132,3 +134,24 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++// add by mike meng
++void backtrace(){
++    uint64 fp = r_fp();
++	uint64 bottom = PGROUNDUP(fp);
++	uint64 address;
++	char path[128];
++	int line;
++
++	printf("backtrace:\n");
++	while(1){
++		//printf("%p\n",*((uint64 *)(fp-8)));
++		address = *((uint64 *)(fp-8));
++	    memset(path,0,sizeof(path));
++		ltaddr2line(address,path,&line);
++		printf("pc = %p, %s:%d\n",address,path,line);
++		fp = *((uint64 *)(fp-16));
++	    if(fp >= bottom) break;
++	}	
++}
++
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..8265a98 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -40,6 +40,7 @@ procinit(void)
+       uint64 va = KSTACK((int) (p - proc));
+       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+       p->kstack = va;
++	  p->alarmworking = 0;
+   }
+   kvminithart();
+ }
+@@ -112,6 +113,10 @@ found:
+     release(&p->lock);
+     return 0;
+   }
++  // we initial the alarm handler
++  p->alarminterval = 0;
++  p->alarmhandler = 0;
++  p->alarmtick = 0;
+ 
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+@@ -149,6 +154,9 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  p->alarminterval = 0;
++  p->alarmhandler = 0;
++  p->alarmtick = 0;
+   p->state = UNUSED;
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..2820b91 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -82,6 +82,7 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++typedef void (*func)();
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -94,6 +95,13 @@ struct proc {
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+ 
++  //alarm
++  int alarminterval;
++  int alarmtick;
++  int alarmworking;
++  struct trapframe alarmtrap;
++  func alarmhandler;
++    
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..9a3cab3 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -319,6 +319,15 @@ sfence_vma()
+   asm volatile("sfence.vma zero, zero");
+ }
+ 
++// call frame pointer
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
+ 
+ #define PGSIZE 4096 // bytes per page
+ #define PGSHIFT 12  // bits of offset within a page
+@@ -349,6 +358,6 @@ sfence_vma()
+ // Sv39, to avoid having to sign-extend virtual addresses
+ // that have the high bit set.
+ #define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
+-
++#define NULL 0
+ typedef uint64 pte_t;
+ typedef uint64 *pagetable_t; // 512 PTEs
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..bc098ec 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,10 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
++extern uint64 sys_ltatbleinit(void);
++
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +131,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm] sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
++[SYS_ltatbleinit] sys_ltatbleinit,
+ };
+ 
+ void
+@@ -144,3 +151,6 @@ syscall(void)
+     p->trapframe->a0 = -1;
+   }
+ }
++
++
++
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..74f4e57 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm 22
++#define SYS_sigreturn 23
++#define SYS_ltatbleinit 24
++
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..ed954f6 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -69,7 +69,9 @@ sys_sleep(void)
+     }
+     sleep(&ticks, &tickslock);
+   }
++  
+   release(&tickslock);
++  backtrace();
+   return 0;
+ }
+ 
+@@ -95,3 +97,36 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64 sys_sigreturn(){
++	struct proc * p = myproc();
++	if(p->alarmworking){
++		memmove(p->trapframe,&p->alarmtrap,sizeof(struct trapframe));
++	    p->alarmworking = 0;
++	}
++    return 0;
++}
++
++uint64 sys_sigalarm(){
++	int ticks;
++    uint64 ptr;
++    struct proc * p = myproc();	
++	
++	if(argint(0, &ticks) < 0)
++    	return -1;
++	if(argaddr(1,&ptr) < 0)
++		return -1;
++	
++	acquire(&p->lock);
++	p->alarmworking = 0;
++	p->alarminterval = ticks;
++	p->alarmhandler = (func)ptr;
++	release(&p->lock);
++	
++	return 0;
++}
++
++uint64 sys_ltatbleinit(){
++	ltinit();
++	return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/trampoline.S b/kernel/trampoline.S
+index fabaaf9..ddd5f4c 100644
+--- a/kernel/trampoline.S
++++ b/kernel/trampoline.S
+@@ -60,7 +60,7 @@ uservec:
+         sd t5, 272(a0)
+         sd t6, 280(a0)
+ 
+-	# save the user a0 in p->trapframe->a0
++	    # save the user a0 in p->trapframe->a0
+         csrr t0, sscratch
+         sd t0, 112(a0)
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..4b6d3fd 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -43,13 +43,15 @@ usertrap(void)
+ 
+   // send interrupts and exceptions to kerneltrap(),
+   // since we're now in the kernel.
++  // interrupts process will be set to kernelvec.
+   w_stvec((uint64)kernelvec);
+ 
+   struct proc *p = myproc();
+   
+   // save user program counter.
+   p->trapframe->epc = r_sepc();
+-  
++
++  //if the interrupts is system call
+   if(r_scause() == 8){
+     // system call
+ 
+@@ -62,8 +64,10 @@ usertrap(void)
+ 
+     // an interrupt will change sstatus &c registers,
+     // so don't enable until done with those registers.
++    //open interrrupt
+     intr_on();
+ 
++	// system call
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+@@ -77,8 +81,22 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  if(which_dev == 2){
++  	if(!p->alarmworking && p->alarminterval > 0){
++	  p->alarmtick++;
++	  if(p->alarmtick == p->alarminterval){
++		//p->alarmhandler();
++		//p->alarmretaddr = p->trapframe->epc;
++		// we set the epc point  to the alarm handler
++		// when we leave from the trap process,we will get to the alarm handler
++		memmove(&p->alarmtrap,p->trapframe,sizeof(struct trapframe));
++		p->trapframe->epc = (uint64)p->alarmhandler;
++	    p->alarmtick = 0;
++		p->alarmworking = 1;
++	  }
++    }
+     yield();
++  }
+ 
+   usertrapret();
+ }
+@@ -125,6 +143,7 @@ usertrapret(void)
+   // switches to the user page table, restores user registers,
+   // and switches to user mode with sret.
+   uint64 fn = TRAMPOLINE + (userret - trampoline);
++  // userret
+   ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);
+ }
+ 
+@@ -218,3 +237,5 @@ devintr()
+   }
+ }
+ 
++ 
++
+diff --git a/kernel/types.h b/kernel/types.h
+index ee73164..9e2630c 100644
+--- a/kernel/types.h
++++ b/kernel/types.h
+@@ -2,6 +2,7 @@ typedef unsigned int   uint;
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+ 
++typedef char int8;
+ typedef unsigned char uint8;
+ typedef unsigned short uint16;
+ typedef unsigned int  uint32;
+diff --git a/user/alarmtest.c b/user/alarmtest.c
+index 38f09ff..ff3ba7a 100644
+--- a/user/alarmtest.c
++++ b/user/alarmtest.c
+@@ -45,6 +45,7 @@ test0()
+   int i;
+   printf("test0 start\n");
+   count = 0;
++  
+   sigalarm(2, periodic);
+   for(i = 0; i < 1000*500000; i++){
+     if((i % 1000000) == 0)
+@@ -145,6 +146,7 @@ slow_handler()
+ {
+   count++;
+   printf("alarm!\n");
++  printf("count = %d\n",count);
+   if (count > 1) {
+     printf("test2 failed: alarm handler called more than once\n");
+     exit(1);
+diff --git a/user/ar b/user/ar
+new file mode 100644
+index 0000000..1e67a93
+Binary files /dev/null and b/user/ar differ
+diff --git a/user/arrtoline b/user/arrtoline
+new file mode 100644
+index 0000000..1e67a93
+Binary files /dev/null and b/user/arrtoline differ
+diff --git a/user/printf.c b/user/printf.c
+index 5c5c782..0c97c91 100644
+--- a/user/printf.c
++++ b/user/printf.c
+@@ -6,6 +6,9 @@
+ 
+ static char digits[] = "0123456789ABCDEF";
+ 
++unsigned long long u64_host, u64_net;
++unsigned int  u32_host_h, u32_host_l;
++
+ static void
+ putc(int fd, char c)
+ {
+diff --git a/user/sh.c b/user/sh.c
+index 83dd513..a64de56 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -146,6 +146,9 @@ main(void)
+ {
+   static char buf[100];
+   int fd;
++  
++  //init line table
++  ltatbleinit();
+ 
+   // Ensure that three file descriptors are open.
+   while((fd = open("console", O_RDWR)) >= 0){
+@@ -154,7 +157,8 @@ main(void)
+       break;
+     }
+   }
+-
++ 
++  
+   // Read and run input commands.
+   while(getcmd(buf, sizeof(buf)) >= 0){
+     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+diff --git a/user/user.h b/user/user.h
+index b71ecda..0791842 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,10 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
++int ltatbleinit(void);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..791bcef 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
++entry("ltatbleinit");
+\ No newline at end of file
