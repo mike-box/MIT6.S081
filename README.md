@@ -31,7 +31,7 @@
 + lab7:[lab-thread-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-thread-handin)
 + lab8:[lab-lock-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-lock-handin)
 + lab9:[lab-fs-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-fs-handin)
-+ lab10:[lab-fs-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-mmap-handin)
++ lab10:[lab-mmap-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-mmap-handin)
 
 
 
