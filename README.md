@@ -7,6 +7,7 @@
 + piazza课程主页：https://piazza.com/mooc_self-learning_university/fall2020/6s081
     access code: 6s081
 + 中文翻译：https://github.com/huihongxiao/MIT6.S081
++ 在线翻译: https://mit-public-courses-cn-translatio.gitbook.io/mit6-s081/
 
 ## lab summary
 + lab1:[【MIT6.S081】lab1 Unix utilities](https://zhuanlan.zhihu.com/p/378706996)
@@ -18,6 +19,7 @@
 + lab7:[【MIT6.S081】 lab7 thread](https://zhuanlan.zhihu.com/p/419454804)
 + lab8:[【MIT6.S081】 lab8 lock](https://zhuanlan.zhihu.com/p/456281981)
 + lab9:[【MIT6.S081】 lab9 fs](https://zhuanlan.zhihu.com/p/465636130)
++ lab10:[【MIT6.S081】 lab10 mmap](https://zhuanlan.zhihu.com/p/584971591)
 
 ## source code
 + lab1: [lab-util-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-util-handin)
@@ -29,7 +31,7 @@
 + lab7:[lab-thread-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-thread-handin)
 + lab8:[lab-lock-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-lock-handin)
 + lab9:[lab-fs-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-fs-handin)
-
++ lab10:[lab-fs-handin](https://github.com/mike-box/MIT6.S081/tree/main/lab-mmap-handin)
 
 
 
